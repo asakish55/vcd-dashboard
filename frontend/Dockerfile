@@ -39,8 +39,8 @@ RUN rm -f /etc/nginx/conf.d/default.conf.default
 
 EXPOSE 80
 
-# Health check
+# Health check – only verify nginx is serving HTML (not the backend)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost/api/health || exit 1
+    CMD wget -qO- http://localhost/ | grep -q "<!DOCTYPE html>" || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]
