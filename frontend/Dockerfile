@@ -13,10 +13,11 @@ LABEL description="VCD Dashboard Frontend – React + Vite"
 WORKDIR /app
 
 # Copy package files first (better layer caching)
-COPY package.json package-lock.json* ./
+COPY package.json ./
 
 # Install all dependencies (including devDependencies for build)
-RUN npm ci
+# npm install generates package-lock.json if missing; use --legacy-peer-deps for compatibility
+RUN npm install --legacy-peer-deps
 
 # Copy source files
 COPY . .

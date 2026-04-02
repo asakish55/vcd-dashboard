@@ -10,8 +10,6 @@
 # Access dashboard at: http://<server-ip>
 # ─────────────────────────────────────────────────────────────────────────────
 
-version: "3.9"
-
 services:
 
   # ── Backend – FastAPI ────────────────────────────────────────────────────
@@ -61,4 +59,3 @@ services:
 networks:
   vcd-net:
     driver: bridge
-    name: vcd-dashboard-network

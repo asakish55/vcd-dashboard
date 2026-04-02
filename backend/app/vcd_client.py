@@ -30,7 +30,7 @@ class VCDClient:
         self.org = org
         self.token: Optional[str] = None
         self.token_type: str = "Bearer"
-        self.api_version: str = "36.2"
+        self.api_version: str = "36.2"   # will be auto-detected on login
         # verify=False is common in on-prem VCD with self-signed certs
         self.client = httpx.AsyncClient(
             verify=False,
@@ -38,11 +38,55 @@ class VCDClient:
         )
 
     # ──────────────────────────────────────────
+    # API Version Auto-Detection
+    # ──────────────────────────────────────────
+
+    async def detect_api_version(self) -> str:
+        """
+        Call /api/versions (no auth required) and pick the highest
+        supported version. Falls back to 36.2 if detection fails.
+        """
+        try:
+            res = await self.client.get(
+                f"{self.host}/api/versions",
+                headers={"Accept": "application/*+xml"},
+                timeout=15.0,
+            )
+            res.raise_for_status()
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(res.text)
+            ns = {"v": "http://www.vmware.com/vcloud/v1.5"}
+            versions = []
+            for vi in root.findall(".//v:VersionInfo", ns):
+                deprecated = vi.find("v:Deprecated", ns)
+                if deprecated is not None:
+                    continue
+                ver_el = vi.find("v:Version", ns)
+                if ver_el is not None and ver_el.text:
+                    try:
+                        versions.append(float(ver_el.text))
+                    except ValueError:
+                        pass
+            if versions:
+                best = str(max(versions))
+                # keep one decimal place  e.g. 36.0 not 36
+                if "." not in best:
+                    best += ".0"
+                logger.info(f"Auto-detected API versions: {sorted(versions)} → using {best}")
+                return best
+        except Exception as e:
+            logger.warning(f"API version detection failed ({e}), defaulting to 36.2")
+        return "36.2"
+
+    # ──────────────────────────────────────────
     # Authentication
     # ──────────────────────────────────────────
 
     async def login(self) -> str:
         """Authenticate and retrieve session token."""
+        # Step 1: detect the right API version for this VCD instance
+        self.api_version = await self.detect_api_version()
+
         credentials = base64.b64encode(
             f"{self.username}@{self.org}:{self.password}".encode()
         ).decode()
