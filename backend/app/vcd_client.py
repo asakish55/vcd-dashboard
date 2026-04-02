@@ -1,0 +1,320 @@
+"""
+VCD Client - VMware Cloud Director API Client
+Supports VCD API v36+ (VCD 10.3+) with fallback to legacy API
+"""
+
+import httpx
+import base64
+import logging
+from typing import Optional, List, Dict, Any
+
+# Suppress SSL warnings for lab environments
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
+
+
+class VCDClient:
+    """
+    Client for VMware Cloud Director REST API.
+
+    Authentication: Basic Auth → Bearer Token (VCD 10.3.1+) or legacy x-vcloud-authorization
+    API Version: 36.2 (compatible with VCD 10.3+)
+    """
+
+    def __init__(self, host: str, username: str, password: str, org: str = "System"):
+        self.host = host.rstrip("/")
+        self.username = username
+        self.password = password
+        self.org = org
+        self.token: Optional[str] = None
+        self.token_type: str = "Bearer"
+        self.api_version: str = "36.2"
+        # verify=False is common in on-prem VCD with self-signed certs
+        self.client = httpx.AsyncClient(
+            verify=False,
+            timeout=httpx.Timeout(60.0, connect=15.0),
+        )
+
+    # ──────────────────────────────────────────
+    # Authentication
+    # ──────────────────────────────────────────
+
+    async def login(self) -> str:
+        """Authenticate and retrieve session token."""
+        credentials = base64.b64encode(
+            f"{self.username}@{self.org}:{self.password}".encode()
+        ).decode()
+
+        try:
+            response = await self.client.post(
+                f"{self.host}/api/sessions",
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Accept": f"application/*+json;version={self.api_version}",
+                },
+            )
+            response.raise_for_status()
+        except httpx.ConnectError:
+            raise Exception(f"Cannot connect to {self.host}. Check host URL and network.")
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code == 401:
+                raise Exception("Invalid credentials. Check username / password / org.")
+            raise Exception(f"HTTP {code}: {e.response.text[:200]}")
+
+        # VCD 10.3.1+ issues a Bearer JWT token
+        if "x-vmware-vcloud-access-token" in response.headers:
+            self.token = response.headers["x-vmware-vcloud-access-token"]
+            self.token_type = "Bearer"
+        elif "x-vcloud-authorization" in response.headers:
+            self.token = response.headers["x-vcloud-authorization"]
+            self.token_type = "legacy"
+        else:
+            raise Exception("No auth token found in VCD response.")
+
+        logger.info(f"Logged in to {self.host} as {self.username}@{self.org} [{self.token_type}]")
+        return self.token
+
+    def _headers(self, content_type: Optional[str] = None) -> Dict[str, str]:
+        headers: Dict[str, str] = {
+            "Accept": f"application/*+json;version={self.api_version}",
+        }
+        if self.token_type == "Bearer":
+            headers["Authorization"] = f"Bearer {self.token}"
+        else:
+            headers["x-vcloud-authorization"] = self.token  # type: ignore
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
+
+    # ──────────────────────────────────────────
+    # Organizations
+    # ──────────────────────────────────────────
+
+    async def get_orgs(self) -> List[Dict]:
+        """Return all accessible organizations."""
+        try:
+            res = await self.client.get(
+                f"{self.host}/cloudapi/1.0.0/orgs",
+                headers=self._headers(),
+                params={"pageSize": 100, "page": 1},
+            )
+            res.raise_for_status()
+            return res.json().get("values", [])
+        except Exception as e:
+            logger.warning(f"Cloud API orgs failed ({e}), falling back to legacy /api/org")
+            return await self._get_orgs_legacy()
+
+    async def _get_orgs_legacy(self) -> List[Dict]:
+        res = await self.client.get(f"{self.host}/api/org", headers=self._headers())
+        res.raise_for_status()
+        data = res.json()
+        orgs = data.get("org", [])
+        if isinstance(orgs, dict):
+            orgs = [orgs]
+        return [
+            {
+                "id": o["href"].split("/")[-1],
+                "name": o["name"],
+                "displayName": o.get("fullName", o["name"]),
+            }
+            for o in orgs
+        ]
+
+    # ──────────────────────────────────────────
+    # VDCs
+    # ──────────────────────────────────────────
+
+    async def get_vdcs_for_org(self, org_id: str) -> List[Dict]:
+        """Return all VDCs for a given org with full resource details."""
+        vdcs: List[Dict] = []
+
+        # Try Cloud API first (VCD 10.3+)
+        try:
+            res = await self.client.get(
+                f"{self.host}/cloudapi/1.0.0/vdcs",
+                headers=self._headers(),
+                params={
+                    "pageSize": 100,
+                    "filterEncoded": "true",
+                    "filter": f"org.id=={org_id}",
+                },
+            )
+            res.raise_for_status()
+            vdc_list = res.json().get("values", [])
+            for v in vdc_list:
+                # URN format: urn:vcloud:vdc:XXXXXXXX-XXXX-...
+                raw_id = v.get("id", "")
+                vdc_id = raw_id.replace("urn:vcloud:vdc:", "")
+                if vdc_id:
+                    detail = await self._safe_get_vdc(vdc_id, v.get("name", "Unknown"))
+                    vdcs.append(detail)
+            return vdcs
+        except Exception as e:
+            logger.warning(f"Cloud API vdcs failed ({e}), falling back to org links")
+
+        # Fallback: parse VDC links from org response
+        return await self._get_vdcs_from_org_links(org_id)
+
+    async def _get_vdcs_from_org_links(self, org_id: str) -> List[Dict]:
+        res = await self.client.get(f"{self.host}/api/org/{org_id}", headers=self._headers())
+        res.raise_for_status()
+        data = res.json()
+
+        vdcs: List[Dict] = []
+        for link in data.get("link", []):
+            href = link.get("href", "")
+            link_type = link.get("type", "")
+            if "vdc" in link_type.lower() and "/api/vdc/" in href:
+                vdc_id = href.split("/api/vdc/")[-1].split("?")[0]
+                detail = await self._safe_get_vdc(vdc_id)
+                vdcs.append(detail)
+        return vdcs
+
+    async def _safe_get_vdc(self, vdc_id: str, fallback_name: str = "Unknown") -> Dict:
+        try:
+            return await self.get_vdc_details(vdc_id)
+        except Exception as e:
+            logger.error(f"Failed to get VDC {vdc_id}: {e}")
+            return {"id": vdc_id, "name": fallback_name, "error": str(e)}
+
+    async def get_vdc_details(self, vdc_id: str) -> Dict:
+        """Return detailed VDC resource information."""
+        res = await self.client.get(
+            f"{self.host}/api/vdc/{vdc_id}", headers=self._headers()
+        )
+        res.raise_for_status()
+        data = res.json()
+
+        compute = data.get("computeCapacity", {})
+        cpu_info = compute.get("cpu", {})
+        mem_info = compute.get("memory", {})
+
+        cpu_limit_mhz = int(cpu_info.get("limit") or 0)
+        cpu_used_mhz = int(cpu_info.get("used") or 0)
+        cpu_alloc_mhz = int(cpu_info.get("allocated") or 0)
+        mem_limit_mb = int(mem_info.get("limit") or 0)
+        mem_used_mb = int(mem_info.get("used") or 0)
+
+        # Parse storage profiles
+        raw_profiles = data.get("vdcStorageProfile", [])
+        if isinstance(raw_profiles, dict):
+            raw_profiles = [raw_profiles]
+
+        storage_profiles: List[Dict] = []
+        for sp in raw_profiles:
+            if not isinstance(sp, dict):
+                continue
+            limit_mb = int(sp.get("limit") or 0)
+            used_mb = int(sp.get("storageUsedMB") or 0)
+            href = sp.get("href", "")
+            storage_profiles.append(
+                {
+                    "id": href.split("/")[-1],
+                    "name": sp.get("name", "Unknown"),
+                    "limit_mb": limit_mb,
+                    "limit_gb": round(limit_mb / 1024, 1),
+                    "used_mb": used_mb,
+                    "used_gb": round(used_mb / 1024, 1),
+                    "default": bool(sp.get("default")),
+                    "enabled": bool(sp.get("enabled", True)),
+                }
+            )
+
+        return {
+            "id": vdc_id,
+            "name": data.get("name", "Unknown"),
+            "description": data.get("description", ""),
+            "status": int(data.get("status", 0)),
+            "allocation_model": data.get("allocationModel", "AllocationVApp"),
+            "cpu": {
+                "limit_mhz": cpu_limit_mhz,
+                "used_mhz": cpu_used_mhz,
+                "allocated_mhz": cpu_alloc_mhz,
+                # 1 vCPU = 2000 MHz (2 GHz)
+                "vcpu_count": max(1, round(cpu_limit_mhz / 2000)) if cpu_limit_mhz else 0,
+                "vcpu_used": round(cpu_used_mhz / 2000, 1),
+                "vcpu_allocated": round(cpu_alloc_mhz / 2000, 1),
+            },
+            "memory": {
+                "limit_mb": mem_limit_mb,
+                "used_mb": mem_used_mb,
+                "limit_gb": round(mem_limit_mb / 1024, 1),
+                "used_gb": round(mem_used_mb / 1024, 1),
+            },
+            "storage_profiles": storage_profiles,
+            "vapp_count": int(data.get("numberOfVApps") or 0),
+        }
+
+    # ──────────────────────────────────────────
+    # Update VDC compute resources
+    # ──────────────────────────────────────────
+
+    async def update_vdc_resources(
+        self,
+        vdc_id: str,
+        cpu_vcpu: Optional[int] = None,
+        memory_gb: Optional[int] = None,
+    ) -> Dict:
+        """
+        Update VDC CPU and/or Memory limits.
+        Reads current config then PUTs updated version.
+        """
+        res = await self.client.get(
+            f"{self.host}/api/vdc/{vdc_id}", headers=self._headers()
+        )
+        res.raise_for_status()
+        current = res.json()
+
+        if "computeCapacity" not in current:
+            current["computeCapacity"] = {"cpu": {}, "memory": {}}
+
+        if cpu_vcpu is not None:
+            current["computeCapacity"]["cpu"]["limit"] = cpu_vcpu * 2000  # MHz
+
+        if memory_gb is not None:
+            current["computeCapacity"]["memory"]["limit"] = memory_gb * 1024  # MB
+
+        # Remove read-only & storage fields from PUT body
+        for field in ("vdcStorageProfile", "resourceEntities", "availableNetworks",
+                      "capabilities", "nicQuota", "networkQuota", "usedNetworkCount",
+                      "numberOfVApps", "numberOfRunningVMs"):
+            current.pop(field, None)
+
+        ct = f"application/vnd.vmware.vcloud.vdc+json;version={self.api_version}"
+        put = await self.client.put(
+            f"{self.host}/api/vdc/{vdc_id}",
+            headers=self._headers(content_type=ct),
+            json=current,
+        )
+        put.raise_for_status()
+        return {"success": True, "message": "VDC compute resources updated successfully"}
+
+    # ──────────────────────────────────────────
+    # Update Storage Profile
+    # ──────────────────────────────────────────
+
+    async def update_storage_profile(self, profile_id: str, limit_gb: int) -> Dict:
+        """Update storage profile quota limit (in GB)."""
+        res = await self.client.get(
+            f"{self.host}/api/vdcStorageProfile/{profile_id}",
+            headers=self._headers(),
+        )
+        res.raise_for_status()
+        current = res.json()
+
+        current["limit"] = limit_gb * 1024  # MB
+
+        ct = f"application/vnd.vmware.vcloud.vdcStorageProfile+json;version={self.api_version}"
+        put = await self.client.put(
+            f"{self.host}/api/vdcStorageProfile/{profile_id}",
+            headers=self._headers(content_type=ct),
+            json=current,
+        )
+        put.raise_for_status()
+        return {"success": True, "message": f"Storage profile updated to {limit_gb} GB"}
+
+    async def close(self):
+        await self.client.aclose()

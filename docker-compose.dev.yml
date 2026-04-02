@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# VCD Dashboard – docker-compose.dev.yml (Development mode)
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up
+#
+# Features:
+#   - Backend: hot-reload on code changes (--reload flag)
+#   - Frontend: Vite dev server (http://localhost:3000) with HMR
+#   - Backend API exposed on port 8000 for direct testing
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vcd-backend-dev
+    volumes:
+      - ./backend:/app          # Mount source for live reload
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "8000:8000"             # Expose for direct API access / Swagger UI
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=debug
+    networks:
+      - vcd-dev-net
+
+  frontend:
+    image: node:20-alpine
+    container_name: vcd-frontend-dev
+    working_dir: /app
+    volumes:
+      - ./frontend:/app         # Mount source for HMR
+      - /app/node_modules       # Anonymous volume to protect node_modules
+    command: sh -c "npm ci && npm run dev"
+    ports:
+      - "3000:3000"             # Vite dev server
+    environment:
+      - VITE_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - vcd-dev-net
+
+networks:
+  vcd-dev-net:
+    driver: bridge
