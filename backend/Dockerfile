@@ -33,4 +33,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
 
 # Run the application
 # Use --workers 2 for small deployments (adjust for production)
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Single worker - sessions are stored in memory, multiple workers would lose sessions
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

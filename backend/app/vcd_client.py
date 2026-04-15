@@ -182,15 +182,18 @@ class VCDClient:
     async def get_vdcs_for_org(self, org_id: str) -> List[Dict]:
         """
         מחזיר את כל ה-VDCs של Org מסוים.
+        מנסה 4 שיטות לפי סדר עד שמוצא תוצאות.
 
-        ניסיון 1: Cloud API עם filter לפי org (URN ו-UUID)
-        ניסיון 2: Legacy API - קריאה ל-/api/org/{id} וחילוץ לינקים
-        ניסיון 3: Query API - /api/query?type=orgVdc&filter=orgName=={name}
+        ניסיון 1: Cloud API עם filter לפי org
+        ניסיון 2: Admin Query API (adminVdc) - עובד עם System admin
+        ניסיון 3: Admin org path /api/admin/org/{id}/vdcs
+        ניסיון 4: Legacy org links /api/org/{id}
         """
         uuid = self._urn_to_uuid(org_id)
+        logger.info(f"Loading VDCs for org {uuid} (original: {org_id})")
 
         # ── ניסיון 1: Cloud API ──────────────────────────────
-        for filter_id in [org_id, f"urn:vcloud:org:{uuid}", uuid]:
+        for filter_id in [f"urn:vcloud:org:{uuid}", uuid, org_id]:
             try:
                 res = await self.client.get(
                     f"{self.host}/cloudapi/1.0.0/vdcs",
@@ -204,30 +207,78 @@ class VCDClient:
                 res.raise_for_status()
                 vdc_list = res.json().get("values", [])
                 if vdc_list:
-                    logger.info(f"Cloud API found {len(vdc_list)} VDCs for org {filter_id}")
+                    logger.info(f"[Method 1] Cloud API: {len(vdc_list)} VDCs")
                     return await self._resolve_vdc_list(vdc_list)
             except Exception as e:
-                logger.debug(f"Cloud API filter '{filter_id}' failed: {e}")
+                logger.debug(f"[Method 1] Cloud API filter '{filter_id}' failed: {e}")
 
-        # ── ניסיון 2: Legacy org links ───────────────────────
+        # ── ניסיון 2: Admin Query API (adminVdc) ─────────────
+        # adminVdc עובד עם System admin גם לORGs שלא נגישים ב-orgVdc
+        for query_type in ["adminVdc", "orgVdc"]:
+            try:
+                res = await self.client.get(
+                    f"{self.host}/api/query",
+                    headers=self._headers(),
+                    params={
+                        "type": query_type,
+                        "format": "json",
+                        "filter": f"orgId=={uuid}",
+                        "pageSize": 100,
+                    },
+                )
+                res.raise_for_status()
+                data = res.json()
+                records = data.get("record", [])
+                if isinstance(records, dict):
+                    records = [records]
+                if records:
+                    logger.info(f"[Method 2] Query API ({query_type}): {len(records)} VDCs")
+                    vdcs = []
+                    for r in records:
+                        href = r.get("href", "")
+                        if "/api/vdc/" in href:
+                            vdc_id = href.split("/api/vdc/")[-1].split("?")[0]
+                            vdcs.append(await self._safe_get_vdc(vdc_id, r.get("name", "Unknown")))
+                    if vdcs:
+                        return vdcs
+            except Exception as e:
+                logger.debug(f"[Method 2] Query API ({query_type}) failed: {e}")
+
+        # ── ניסיון 3: Admin org path ─────────────────────────
+        # /api/admin/org/{id}/vdcs - נתיב admin מיוחד
+        try:
+            res = await self.client.get(
+                f"{self.host}/api/admin/org/{uuid}/vdcs",
+                headers=self._headers(),
+            )
+            res.raise_for_status()
+            data = res.json()
+            vdc_refs = data.get("vdc", [])
+            if isinstance(vdc_refs, dict):
+                vdc_refs = [vdc_refs]
+            if vdc_refs:
+                logger.info(f"[Method 3] Admin org path: {len(vdc_refs)} VDCs")
+                vdcs = []
+                for ref in vdc_refs:
+                    href = ref.get("href", "")
+                    if "/api/vdc/" in href:
+                        vdc_id = href.split("/api/vdc/")[-1].split("?")[0]
+                        vdcs.append(await self._safe_get_vdc(vdc_id, ref.get("name", "Unknown")))
+                if vdcs:
+                    return vdcs
+        except Exception as e:
+            logger.debug(f"[Method 3] Admin org path failed: {e}")
+
+        # ── ניסיון 4: Legacy org links ───────────────────────
         try:
             vdcs = await self._get_vdcs_from_org_links(uuid)
             if vdcs:
-                logger.info(f"Legacy org links found {len(vdcs)} VDCs")
+                logger.info(f"[Method 4] Legacy org links: {len(vdcs)} VDCs")
                 return vdcs
         except Exception as e:
-            logger.warning(f"Legacy org links failed: {e}")
+            logger.debug(f"[Method 4] Legacy org links failed: {e}")
 
-        # ── ניסיון 3: Query API ──────────────────────────────
-        try:
-            vdcs = await self._get_vdcs_query_api(uuid)
-            if vdcs:
-                logger.info(f"Query API found {len(vdcs)} VDCs")
-                return vdcs
-        except Exception as e:
-            logger.warning(f"Query API failed: {e}")
-
-        logger.warning(f"No VDCs found for org {org_id} via any method")
+        logger.warning(f"No VDCs found for org {uuid} via any of the 4 methods")
         return []
 
     async def _resolve_vdc_list(self, vdc_list: List[Dict]) -> List[Dict]:
